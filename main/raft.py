@@ -36,16 +36,18 @@ def network_delay(func):
     return wrapper
 
 
-class LogEntry:
-    def __init__(self, command: Command, term: int):
+class Entry:
+    def __init__(self, command: Command, term: int, index: int):
         """
         Args:
             command (Any): The command to be stored
             term (int): Term when entry was received by leader
+            index (int): Index when entry was received by leader
         """
         self._command = command
         self._term = term
         self._committed = False
+        self._index = index
 
     @property
     def command(self):
@@ -59,8 +61,16 @@ class LogEntry:
     def committed(self):
         return self._committed
 
+    @property
+    def index(self):
+        return self._index
+
     def commit(self):
         self._committed = True
+
+    @classmethod
+    def from_entry(cls, entry: "Entry") -> "Entry":
+        return Entry(command=entry.command, term=entry.term, index=entry.index)
 
 
 class RaftServer:
@@ -76,7 +86,7 @@ class RaftServer:
         self._other_servers = dict()
         self._is_led = False
         self._election_timeout = random.uniform(0.15, 0.3)
-        self._log: List[LogEntry] = list()
+        self._log: List[Entry] = list()
         self._check_thread = Thread(target=self._check_state)
         self._request_thread_pool = ThreadPoolExecutor(max_workers=server_count)
         self._state_machine = dict()
@@ -146,7 +156,9 @@ class RaftServer:
             self.state = RaftServerState.follower
 
     def _run_leader(self):
-        self._next_indexes = {id(server): len(self._log) for server in self._other_servers}
+        self._next_indexes = {
+            id(server): len(self._log) for server in self._other_servers
+        }
         while self.state == RaftServerState.leader:
             futures = [
                 self._request_thread_pool.submit(
@@ -179,7 +191,7 @@ class RaftServer:
         — it doesn’t contain any log entries)
         """
         if self.state == RaftServerState.leader:
-            self._log.append(LogEntry(command=command, term=self._current_term))
+            self._log.append(Entry(command=command, term=self._current_term))
             failed_replications = 0
             for server in self._other_servers:
                 failed_replications += server.receive_entry(command)
@@ -189,38 +201,103 @@ class RaftServer:
                 server.commit()
         return 0
 
-    def set_entries(self, entries):
+    def set_entries(self, commands: List[Command]) -> None:
+        """
+        Given a list of Entry objects, find the leader
+        node and append the entries to its log, then issue
+        AppendEntries calls in parallel to all follower servers
+        to replicate the entries.
+
+        Args:
+            entries (List[Entry]): A list of Entry objects
+                    to be replicated to all servers and eventually
+                    committed to all state machines.
+        """
         if self.state != RaftServerState.leader:
-            # leader redirect
             leader = self._other_servers[self._leader_id]
-            leader.set_entries(entries)
+            leader.set_entries(commands)
         else:
+
+            entries = self._create_entries(commands)
             prev_log_index = len(self._log) - 1
             prev_log_term = self._log[-1].term
             self._log.extend(entries)
-            futures = [
-                self._request_thread_pool.submit(
-                    server._append_entries,
-                    term=self._current_term,
-                    leader_id=id(self),
-                    prev_log_index=prev_log_index,
-                    prev_log_term=prev_log_term,
-                    entries=entries,
-                    leader_commit=self._commit_index,
-                )
-                for server in self._other_servers
-            ]
-            # replicated onto a majority of servers
-            results = [future.result() for future in cf.as_completed(futures)]
-            # commit all new entries
-            for entry in entries:
-                entry.commit()
-            self._commit_index = len(self._log) - 1
-            self._apply_entries()
+            self._request_thread_pool.submit(
+                self._replicate,
+                entries=entries,
+                prev_log_index=prev_log_index,
+                prev_log_term=prev_log_term,
+                new_commit_index=len(self._log) - 1
+            )
 
-    def _apply_entries(self):
-        for entry in self._log[self._last_applied:]:
-            self._state_machine[entry.command.key] = entry.command.value
+            return self._state_machine[entry.command.key]
+
+    def _replicate(self, entries: List[Entry], prev_log_index, prev_log_term, new_commit_index):
+        
+        successful_replications = 0
+        def increment_success(future):
+            follower_term, success = future.result()
+
+            nonlocal successful_replications
+            if success:
+                successful_replications += 1
+
+        futures = [
+            self._request_thread_pool.submit(
+                server._append_entries,
+                term=self._current_term,
+                leader_id=id(self),
+                prev_log_index=prev_log_index,
+                prev_log_term=prev_log_term,
+                entries=entries,
+                leader_commit=self._commit_index,
+            )
+            for server in self._other_servers
+        ]
+        for future in futures:
+            future.add_done_callback(increment_success)
+        # replicated onto a majority of servers
+        # If followers crash or run slowly, or if network packets are lost,
+        # the leader retries AppendEntries RPCs indefinitely (even after
+        # it has responded to the client) until all followers eventually
+        # store all log entries.
+
+        # A log entry is committed once the leader that created the 
+        # entry has replicated it on a majority of the servers
+        while successful_replications < self._server_count // 2:
+            time.sleep(0.1)
+        else:
+            self._commit_index = new_commit_index
+
+    def _create_entries(self, commands: List[Command]) -> List[Entry]:
+        """
+        Given a list of Command objects, create Entry objects
+        for each and return the resulting list.
+
+        Args:
+            commands (List[Command]): The commands to store in Entry objects
+
+        Returns:
+            List[Entry]: The Entry objects
+        """
+        entries = list()
+        next_index = len(self._log)
+        for command in commands:
+            entries.append(
+                Entry(
+                    command=command,
+                    term=self._leader.current_term,
+                    index=next_index,
+                )
+            )
+            next_index += 1
+
+        return entries
+
+    def _apply_entries(self, index: int) -> None:
+        for i, entry in enumerate(self._log):
+            if i <= index:
+                self._state_machine[entry.command.key] = entry.command.value
 
     @network_delay
     def _append_entries(
@@ -229,10 +306,11 @@ class RaftServer:
         leader_id: int,
         prev_log_index: int,
         prev_log_term: int,
-        entries: List[Any],
+        entries: List[Entry],
         leader_commit: int,
     ) -> Tuple:
-        """Invoked by leader to replicate log entries
+        """
+        Invoked by leader to replicate log entries
 
         Args:
             term (int): leader's term
@@ -258,11 +336,30 @@ class RaftServer:
         if self.state == RaftServerState.candidate:
             self.state == RaftServerState.follower
 
-        if self._log and self._log[prev_log_index].term != prev_log_term:
+        if prev_log_index in range(len(self._log)):
+            if self._log[prev_log_index].term != prev_log_term:
+                return self._current_term, False
+        else:
             return self._current_term, False
 
-        if self._log and self._log[prev_log_index + 1]:
-            pass
+        copied_entries = list()
+        for entry in entries:
+            copied_entries.append(Entry.from_entry(entry))
+
+        if prev_log_index + 1 in range(len(self._log)):
+            for i in range(prev_log_index + 1, len(self._log)):
+                if self._log[i].term != copied_entries[i - prev_log_index].term:
+                    self._log = self._log[:i]
+                    copied_entries = copied_entries[i:]
+                    break
+
+        self._log.extend(copied_entries)
+        if leader_commit > self._commit_index:
+            self._commit_index = min(leader_commit, len(self._log) - 1)
+
+        if leader_commit > self._last_applied:
+            self._last_applied += 1
+            self._apply_entries()
 
         return self._current_term, True
 
@@ -270,7 +367,8 @@ class RaftServer:
     def request_vote(
         self, term: int, candidate_id: int, last_log_index: int, last_log_term: int
     ) -> Tuple:
-        """Invoked by candidates to gather votes
+        """
+        Invoked by candidates to gather votes
 
         Args:
             term (int): candidate's term
@@ -329,12 +427,8 @@ class RaftCluster:
             server.start()
 
     def set(self, **kwargs):
-        log_entries = [
-            LogEntry(command=Command(key=k, value=v), term=self._leader.current_term)
-            for k, v in kwargs.items()
-        ]
-        self._leader.set_entries(log_entries)
-
+        commands = [Command(key=k, value=v) for k, v in kwargs.items()]
+        self._leader.set_entries(commands)
 
 
 if __name__ == "__main__":
