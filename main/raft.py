@@ -8,13 +8,17 @@ from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 from functools import wraps
 from threading import Thread
-from typing import Callable, List, Tuple
+from typing import Callable, List, Tuple, Dict
 
 import names
 
 Command = namedtuple("Command", "key value")
 
 logging.basicConfig(level=logging.INFO)
+
+HEARTBEAT_INTERVAL = 0.05
+ELECTION_TIMEOUT_INTERVAL_RANGE = (0.05, 0.075)
+NETWORK_DELAY_INTERVAL_RANGE = (0.05, 0.075)
 
 
 class RaftServerState(Enum):
@@ -32,7 +36,7 @@ def network_delay(func):
 
     @wraps(func)
     def wrapper(*args, **kwargs):
-        time.sleep(random.uniform(0.05, 0.075))
+        time.sleep(random.uniform(*NETWORK_DELAY_INTERVAL_RANGE))
         return func(*args, **kwargs)
 
     return wrapper
@@ -87,11 +91,15 @@ class ElectionTimeout:
 
     def __init__(self, callback: Callable):
         self._callback = callback
-        self._timer = threading.Timer(random.uniform(0.15, 0.3), self._callback)
+        self._timer = threading.Timer(
+            random.uniform(*ELECTION_TIMEOUT_INTERVAL_RANGE), self._callback
+        )
 
     def reset(self):
         self._timer.cancel()
-        self._timer = threading.Timer(random.uniform(0.15, 0.3), self._callback)
+        self._timer = threading.Timer(
+            random.uniform(*ELECTION_TIMEOUT_INTERVAL_RANGE), self._callback
+        )
         self._timer.start()
 
 
@@ -153,7 +161,7 @@ class RaftServer:
         self._state_loop_thread.start()
 
     def stop(self):
-        logging.info(f"Server: {self.id} stopping..")
+        logging.info(f"Server: {self.id} stopping...")
         self._running = False
         self._events["stopped"].wait()
 
@@ -169,7 +177,14 @@ class RaftServer:
             self._leader_id = leader_id
 
     @property
-    def other_servers(self) -> List["RaftServer"]:
+    def other_servers(self) -> Dict:
+        """
+        Returns a dict of RaftServer instances within
+        the cluster other than the current server
+
+        Returns:
+            dict: Maps server id to server instance
+        """
         if not hasattr(self, "_other_servers"):
             self._other_servers = {
                 server.id: server
@@ -269,8 +284,9 @@ class RaftServer:
             ]
             results = [future.result() for future in cf.as_completed(futures)]
             self._cluster_events["leader_established"].set()
-            time.sleep(0.05)
+            time.sleep(HEARTBEAT_INTERVAL)
             logging.debug(f"Leader: {self.id} heartbeat {results}")
+
         self._cluster_events["leader_established"].clear()
         logging.info(f"Server: {self.id} no longer leader")
 
@@ -289,7 +305,6 @@ class RaftServer:
         if self.state != RaftServerState.leader:
             self.leader.set_entries(commands)
         else:
-
             entries = self._create_entries(commands)
             prev_log_index = len(self._log) - 1
             prev_log_term = self._log[-1].term if self._log else 0
