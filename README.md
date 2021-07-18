@@ -1,8 +1,8 @@
 # raft
-
-Implementations of the Raft algorithm within a simulated network. See [In Search of an Understandable Consensus Algorithm](https://raft.github.io/raft.pdf) for details.
+> Implementations of the Raft algorithm within a simulated network.
 
 This is an endeavor to better understand the complex problem of distibuted consensus by implementing the Raft algorithm.
+See [In Search of an Understandable Consensus Algorithm](https://raft.github.io/raft.pdf) for details.
 
 ## Project Phases
 ### In-Memory Servers
