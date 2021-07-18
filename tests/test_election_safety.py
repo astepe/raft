@@ -13,6 +13,6 @@ class TestElectionSafety:
         leader_ids = set()
         for server in raft_cluster.servers:
             leader_ids.add(server.leader_id)
-        
+
         assert len(leader_ids) == 1
         raft_cluster.stop()

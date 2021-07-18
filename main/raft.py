@@ -1,4 +1,5 @@
 import concurrent.futures as cf
+from http import server
 import logging
 import random
 import threading
@@ -8,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 from functools import wraps
 from threading import Thread
-from typing import Callable, List, Tuple, Dict
+from typing import List, Tuple, Dict
 
 import names
 
@@ -16,9 +17,9 @@ Command = namedtuple("Command", "key value")
 
 logging.basicConfig(level=logging.INFO)
 
-HEARTBEAT_INTERVAL = 0.05
+HEARTBEAT_INTERVAL = 0.03
 ELECTION_TIMEOUT_INTERVAL_RANGE = (0.05, 0.075)
-NETWORK_DELAY_INTERVAL_RANGE = (0.05, 0.075)
+NETWORK_DELAY_INTERVAL_RANGE = (0.005, 0.0075)
 
 
 class RaftServerState(Enum):
@@ -86,21 +87,26 @@ class ElectionTimeout:
     """
     Acts as the election timeout mechanism. To prevent split votes,
     election timeouts are chosen randomly from a fixed interval of 150–300ms.
-    The provided callback will be invoked when the timer expires.
     """
 
-    def __init__(self, callback: Callable):
-        self._callback = callback
-        self._timer = threading.Timer(
-            random.uniform(*ELECTION_TIMEOUT_INTERVAL_RANGE), self._callback
+    def __init__(self):
+        self._timeout = threading.Event()
+        self._timer = self._create_timer()
+
+    def _create_timer(self):
+        return threading.Timer(
+            random.uniform(*ELECTION_TIMEOUT_INTERVAL_RANGE), self._timeout.set
         )
 
     def reset(self):
         self._timer.cancel()
-        self._timer = threading.Timer(
-            random.uniform(*ELECTION_TIMEOUT_INTERVAL_RANGE), self._callback
-        )
+        self._timer = self._create_timer()
         self._timer.start()
+
+    def wait(self):
+        self._timeout.wait()
+        self._timeout.clear()
+
 
 
 class Vote:
@@ -112,19 +118,25 @@ class Vote:
 
     def __init__(self):
         self._value = None
+        self._term = None
+        self._voter = None
 
     @property
     def value(self):
         return self._value
 
-    @value.setter
-    def value(self, value: str):
+    def set(self, value: str, term, voter):
         if self._value is None:
             self._value = value
+            self._term = term
+            self._voter = voter
         if value != self._value:
             raise ValueError(
-                f"Cannot change vote after it was cast! {self._value} to {value}"
+                f"Voter {voter} tried to change {self._value} to {value} for term {term}"
             )
+        
+    def __repr__(self):
+        return f"Vote: {self._value}, Voter: {self._voter}, Term: {self._term}"
 
 
 class RaftServer:
@@ -139,11 +151,10 @@ class RaftServer:
         self._log: List[Entry] = list()
         self._state_loop_thread = Thread(target=self._run_state_loop)
         self._events = {
-            "no_leader": threading.Event(),
             "stopped": threading.Event(),
         }
         self._cluster_events = cluster_events
-        self._election_timeout = ElectionTimeout(self._events["no_leader"].set)
+        self._election_timeout = ElectionTimeout()
         self._request_thread_pool = ThreadPoolExecutor()
         self._state_machine = dict()
         self._id = names.get_first_name()
@@ -167,7 +178,7 @@ class RaftServer:
 
     @property
     def leader_id(self):
-        if self.state == RaftServerState.leader:
+        if self._state == RaftServerState.leader:
             return self.id
         return self._leader_id
 
@@ -201,17 +212,19 @@ class RaftServer:
     def servers(self, servers: List["RaftServer"]):
         self._servers = {server.id: server for server in servers}
 
+    def _set_follower(self):
+        self._state = RaftServerState.follower
+        self._election_timeout.reset()
+
     def _run_state_loop(self):
         while self._running:
-            if self.state == RaftServerState.follower:
+            if self._state == RaftServerState.follower:
                 self._election_timeout.reset()
-                self._events["no_leader"].wait()
-                self._events["no_leader"].clear()
+                self._election_timeout.wait()
 
-            self.state = RaftServerState.candidate
             self._run_candidate()
 
-            if self.state == RaftServerState.leader:
+            if self._state == RaftServerState.leader:
                 self._run_leader()
         self._events["stopped"].set()
 
@@ -222,12 +235,13 @@ class RaftServer:
         to become the new leader.
         """
         self._current_term += 1
+        self._state = RaftServerState.candidate
 
         if self._term_votes[self._current_term].value is not None:
-            self.state = RaftServerState.follower
+            self._set_follower()
             return
 
-        self._term_votes[self._current_term].value = self.id
+        self._term_votes[self._current_term].set(self.id, self._current_term, self.id)
         logging.debug(
             f"Candidate: {self.id} in term {self._current_term} voting for {self.id}."
         )
@@ -247,18 +261,18 @@ class RaftServer:
 
         if max_term > self._current_term:
             self._current_term = max_term
-            logging.info(f"Candidate: {self.id} current term lower than {max_term}")
-            self.state = RaftServerState.follower
+            logging.info(f"Candidate: {self.id} current term lower than term {max_term} from other server. Becoming follower.")
+            self._set_follower()
         elif vote_total > len(self.servers) / 2:
             logging.info(
-                f"Candidate: {self.id} elected as leader with {vote_total} votes..."
+                f"Candidate: {self.id} elected as leader with {vote_total} votes in term {self._current_term}."
             )
-            self.state = RaftServerState.leader
+            self._state = RaftServerState.leader
         else:
             logging.info(
-                f"Candidate: {self.id} lost election with {vote_total} votes..."
+                f"Candidate: {self.id} lost election with {vote_total} vote{'s' if vote_total != 1 else ''}."
             )
-            self.state = RaftServerState.follower
+            self._set_follower()
 
     def _run_leader(self):
         """
@@ -269,7 +283,7 @@ class RaftServer:
             server.id: len(self._log) for server in self.other_servers.values()
         }
         self._match_indexes = {server.id: 0 for server in self.other_servers.values()}
-        while self._running and self.state == RaftServerState.leader:
+        while self._running and self._state == RaftServerState.leader:
             futures = [
                 self._request_thread_pool.submit(
                     server._append_entries,
@@ -283,12 +297,18 @@ class RaftServer:
                 for server in self.other_servers.values()
             ]
             results = [future.result() for future in cf.as_completed(futures)]
-            self._cluster_events["leader_established"].set()
-            time.sleep(HEARTBEAT_INTERVAL)
-            logging.debug(f"Leader: {self.id} heartbeat {results}")
+            max_term = max([result[0] for result in results])
+            if max_term > self._current_term:
+                self._current_term = max_term
+                logging.info(f"Leader: {self.id} current term lower than term {max_term} from other server. Becoming follower.")
+                self._set_follower()
+            else:
+                self._cluster_events["leader_established"].set()
+                time.sleep(HEARTBEAT_INTERVAL)
+                logging.debug(f"Leader: {self.id} heartbeat {results}.")
 
         self._cluster_events["leader_established"].clear()
-        logging.info(f"Server: {self.id} no longer leader")
+        logging.info(f"Server: {self.id} no longer leader.")
 
     def set_entries(self, commands: List[Command]) -> None:
         """
@@ -349,7 +369,7 @@ class RaftServer:
                 )
                 if follower_term > self._current_term:
                     self._current_term = follower_term
-                    self._state = RaftServerState.follower
+                    self._set_follower()
                     return
 
                 if not success:
@@ -418,7 +438,7 @@ class RaftServer:
 
         return self._state_machine[entry.command.key]
 
-    @network_delay
+    # @network_delay
     def _append_entries(
         self,
         term: int,
@@ -447,11 +467,15 @@ class RaftServer:
             f"Candidate: {self.id} received heartbeat for "
             f"term {term} and current term {self._current_term} from {leader_id}"
         )
-        self._election_timeout.reset()
-        self.state == RaftServerState.follower
-        self.leader_id = leader_id
         if term < self._current_term:
             return self._current_term, False
+
+        if term > self._current_term:
+            self._current_term = term
+        self._election_timeout.reset()
+        self._state == RaftServerState.follower
+        self.leader_id = leader_id
+        logging.debug(f"Server: {self.id} is now following {leader_id}.")
 
         # Reply false if log doesn’t contain an entry at
         # prev_log_index whose term matches prev_log_term
@@ -490,7 +514,7 @@ class RaftServer:
 
         return self._current_term, True
 
-    @network_delay
+    # @network_delay
     def request_vote(
         self, term: int, candidate_id: int, last_log_index: int, last_log_term: int
     ) -> Tuple:
@@ -510,6 +534,10 @@ class RaftServer:
         # Reply false if term < currentTerm
         if term < self._current_term:
             return self._current_term, False
+        
+        if term > self._current_term:
+            self._current_term = term
+            self._set_follower()
 
         # If votedFor is null or candidateId, and candidate’s log is at
         # least as up-to-date as receiver’s log, grant vote
@@ -517,8 +545,8 @@ class RaftServer:
             self._term_votes[term].value is None
             or self._term_votes[term].value == candidate_id
         ) and len(self._log) <= last_log_index:
-            logging.info(f"Server: {self.id} in term {term} voting for {candidate_id}.")
-            self._term_votes[term].value = candidate_id
+            self._term_votes[term].set(candidate_id, term, self.id)
+            logging.info(f"Server: {self.id} in term {term} voting for {candidate_id}")
             return self._current_term, True
 
         return self._current_term, False
@@ -535,21 +563,18 @@ class RaftServer:
     def state(self):
         return self._state
 
-    @state.setter
-    def state(self, state: RaftServerState):
-        self._state = state
-
     def __repr__(self):
         return f"{self.__class__}, RaftServerState: {self.state}, id: {self.id}"
 
 
 class RaftCluster:
     def __init__(self, server_count=3):
-        self._cluster_events = {
+        self._events = {
             "leader_established": threading.Event(),
+            "stopped": threading.Event(),
         }
         self._servers = [
-            RaftServer(cluster_events=self._cluster_events) for _ in range(server_count)
+            RaftServer(cluster_events=self._events) for _ in range(server_count)
         ]
         for server in self._servers:
             server.servers = list(self._servers)
@@ -558,13 +583,15 @@ class RaftCluster:
     def start(self):
         for server in self._servers:
             server.start()
-        self._cluster_events["leader_established"].wait()
+        self._events["leader_established"].wait()
+        self._events["stopped"].wait()
 
     def stop(self):
         futures = list()
         for server in self._servers:
             futures.append(self._thread_pool.submit(server.stop))
         cf.wait(futures)
+        self._events["stopped"].set()
 
     @property
     def leader(self):
@@ -582,5 +609,5 @@ class RaftCluster:
 if __name__ == "__main__":
     raft_cluster = RaftCluster()
     raft_cluster.start()
-    raft_cluster.set(x=3, y=5)
+    # raft_cluster.set(x=3, y=5)
     raft_cluster.stop()
