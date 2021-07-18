@@ -1,5 +1,4 @@
 import concurrent.futures as cf
-from http import server
 import logging
 import random
 import threading
@@ -9,7 +8,8 @@ from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 from functools import wraps
 from threading import Thread
-from typing import List, Tuple, Dict
+from typing import List, Tuple
+from queue import SimpleQueue
 
 import names
 
@@ -108,7 +108,6 @@ class ElectionTimeout:
         self._timeout.clear()
 
 
-
 class Vote:
     """
     Vote values can only move from None
@@ -125,16 +124,30 @@ class Vote:
     def value(self):
         return self._value
 
-    def set(self, value: str, term, voter):
+    def set(self, value: str, term: int, voter: str):
+        """
+        Set a value for the vote while providing the
+        term number and voter id.
+
+        Args:
+            value (str): The value of the vote
+            term (int): The term in which the vote was cast
+            voter (str): The voter who is voting
+
+        Raises:
+            ValueError: Raised if an attempt was made to change
+                the value of a vote that was already cast
+        """
         if self._value is None:
             self._value = value
             self._term = term
             self._voter = voter
+
         if value != self._value:
             raise ValueError(
                 f"Voter {voter} tried to change {self._value} to {value} for term {term}"
             )
-        
+
     def __repr__(self):
         return f"Vote: {self._value}, Voter: {self._voter}, Term: {self._term}"
 
@@ -161,23 +174,29 @@ class RaftServer:
         self._term_votes = defaultdict(Vote)
 
     @property
-    def id(self):
+    def id(self) -> str:
         """
         The unique id of the server
         """
         return self._id
 
     def start(self):
+        """
+        Start the server
+        """
         self._running = True
         self._state_loop_thread.start()
 
     def stop(self):
+        """
+        Stop the server
+        """
         logging.info(f"Server: {self.id} stopping...")
         self._running = False
         self._events["stopped"].wait()
 
     @property
-    def leader_id(self):
+    def leader_id(self) -> str:
         if self._state == RaftServerState.leader:
             return self.id
         return self._leader_id
@@ -188,7 +207,7 @@ class RaftServer:
             self._leader_id = leader_id
 
     @property
-    def other_servers(self) -> Dict:
+    def other_servers(self) -> dict:
         """
         Returns a dict of RaftServer instances within
         the cluster other than the current server
@@ -261,7 +280,9 @@ class RaftServer:
 
         if max_term > self._current_term:
             self._current_term = max_term
-            logging.info(f"Candidate: {self.id} current term lower than term {max_term} from other server. Becoming follower.")
+            logging.info(
+                f"Candidate: {self.id} current term lower than term {max_term} from other server. Becoming follower."
+            )
             self._set_follower()
         elif vote_total > len(self.servers) / 2:
             logging.info(
@@ -284,14 +305,16 @@ class RaftServer:
         }
         self._match_indexes = {server.id: 0 for server in self.other_servers.values()}
         while self._running and self._state == RaftServerState.leader:
+            prev_log_index = len(self._log) - 1
+            prev_log_term = self._log[-1].term if self._log else 0
             futures = [
                 self._request_thread_pool.submit(
                     server._append_entries,
                     term=self._current_term,
                     leader_id=self.id,
-                    prev_log_index=None,
-                    prev_log_term=None,
-                    entries=[],
+                    prev_log_index=prev_log_index,
+                    prev_log_term=prev_log_term,
+                    entries=list(),
                     leader_commit=self._commit_index,
                 )
                 for server in self.other_servers.values()
@@ -300,7 +323,9 @@ class RaftServer:
             max_term = max([result[0] for result in results])
             if max_term > self._current_term:
                 self._current_term = max_term
-                logging.info(f"Leader: {self.id} current term lower than term {max_term} from other server. Becoming follower.")
+                logging.info(
+                    f"Leader: {self.id} current term lower than term {max_term} from other server. Becoming follower."
+                )
                 self._set_follower()
             else:
                 self._cluster_events["leader_established"].set()
@@ -353,7 +378,7 @@ class RaftServer:
                                 etries are replicated on a majority of followers
         """
 
-        successful_replications = 0
+        replications = SimpleQueue()
 
         def call_append_entries_with_retries(server, prev_log_index, prev_log_term):
             success = False
@@ -380,22 +405,16 @@ class RaftServer:
                     self._next_indexes[server.id] = self._commit_index + 1
                     self._match_indexes[server.id] = self._commit_index
 
-            nonlocal successful_replications
-            successful_replications += 1
+            replications.put(1)
 
         for server in self.other_servers.values():
             self._request_thread_pool.submit(
                 call_append_entries_with_retries, server, prev_log_index, prev_log_term
             )
 
-        # replicated onto a majority of servers
-        # If followers crash or run slowly, or if network packets are lost,
-        # the leader retries AppendEntries RPCs indefinitely (even after
-        # it has responded to the client) until all followers eventually
-        # store all log entries.
-
-        while successful_replications < len(self.servers) // 2:
-            time.sleep(0.1)
+        successful_replications = 1
+        while successful_replications < round(len(self.servers) / 2):
+            successful_replications += replications.get()
         else:
             # A log entry is committed once the leader that created the
             # entry has replicated it on a majority of the servers
@@ -424,11 +443,11 @@ class RaftServer:
             )
             next_index += 1
 
-        logging.info(f"Server {self.id} entries {self._log}")
         return entries
 
     def _apply_entries(self, index: int) -> None:
-        for i, entry in enumerate(self._log):
+        for i in range(self._last_applied, len(self._log)):
+            entry = self._log[i]
             if i <= index:
                 logging.info(f"Server {self.id} applying entry {entry}")
                 self._state_machine[entry.command.key] = entry.command.value
@@ -470,41 +489,35 @@ class RaftServer:
         if term < self._current_term:
             return self._current_term, False
 
-        if term > self._current_term:
-            self._current_term = term
-        self._election_timeout.reset()
-        self._state == RaftServerState.follower
+        self._current_term = term
+        self._set_follower()
         self.leader_id = leader_id
         logging.debug(f"Server: {self.id} is now following {leader_id}.")
 
         # Reply false if log doesn’t contain an entry at
         # prev_log_index whose term matches prev_log_term
         if prev_log_index != -1:
-            if prev_log_index in range(len(self._log)):
-                if self._log[prev_log_index].term != prev_log_term:
-                    return self._current_term, False
-            else:
+            if prev_log_index not in range(len(self._log)) or self._log[prev_log_index].term != prev_log_term:
                 return self._current_term, False
 
         # create new copies of all entries so objects in memory are not
         # shared between nodes
-        copied_entries = list()
+        new_entries = list()
         for entry in entries:
-            copied_entries.append(Entry.from_entry(entry))
+            new_entries.append(Entry.from_entry(entry))
 
         # If an existing entry conflicts with a new one (same index
         # but different terms), delete the existing entry and all that
         # follow it
         if prev_log_index + 1 in range(len(self._log)):
             for i in range(prev_log_index + 1, len(self._log)):
-                if self._log[i].term != copied_entries[i - prev_log_index].term:
+                if self._log[i].term != new_entries[i - prev_log_index - 1].term:
                     self._log = self._log[:i]
-                    copied_entries = copied_entries[i:]
+                    new_entries = new_entries[i:]
                     break
 
         # Append any new entries not already in the log
-        logging.info(f"Follower: {self.id} replicating entries to log {copied_entries}")
-        self._log.extend(copied_entries)
+        self._log.extend(new_entries)
 
         if leader_commit > self._commit_index:
             self._commit_index = min(leader_commit, len(self._log) - 1)
@@ -534,7 +547,7 @@ class RaftServer:
         # Reply false if term < currentTerm
         if term < self._current_term:
             return self._current_term, False
-        
+
         if term > self._current_term:
             self._current_term = term
             self._set_follower()
@@ -584,7 +597,7 @@ class RaftCluster:
         for server in self._servers:
             server.start()
         self._events["leader_established"].wait()
-        self._events["stopped"].wait()
+        # self._events["stopped"].wait()
 
     def stop(self):
         futures = list()
@@ -609,5 +622,7 @@ class RaftCluster:
 if __name__ == "__main__":
     raft_cluster = RaftCluster()
     raft_cluster.start()
-    # raft_cluster.set(x=3, y=5)
-    raft_cluster.stop()
+    raft_cluster.set(x=3, y=5)
+    logging.info("Response returned")
+    raft_cluster._events["stopped"].wait()
+    # raft_cluster.stop()
