@@ -7,9 +7,9 @@ from collections import defaultdict, namedtuple
 from concurrent.futures import ThreadPoolExecutor
 from enum import Enum
 from functools import wraps
-from threading import Thread
-from typing import List, Tuple
 from queue import SimpleQueue
+from threading import Thread
+from typing import Dict, List, Tuple
 
 import names
 
@@ -44,6 +44,9 @@ def network_delay(func):
 
 
 class Entry:
+    """
+    Represents an entry in a server log
+    """
     def __init__(self, command: Command, term: int, index: int):
         """
         Args:
@@ -153,6 +156,10 @@ class Vote:
 
 
 class RaftServer:
+    """
+    Encapsulates all of the logic specific to a Raft server as defined by
+    the Raft specification.
+    """
     def __init__(self, cluster_events: List[threading.Event]):
         self._state: RaftServerState = RaftServerState.follower
         self._leader_id = None
@@ -224,7 +231,13 @@ class RaftServer:
         return self._other_servers
 
     @property
-    def servers(self) -> List["RaftServer"]:
+    def servers(self) -> Dict:
+        """
+        Returns a dict that maps server ids to server objects
+
+        Returns:
+            Dict: The server mapping
+        """
         return self._servers
 
     @servers.setter
@@ -416,8 +429,6 @@ class RaftServer:
         while successful_replications < round(len(self.servers) / 2):
             successful_replications += replications.get()
         else:
-            # A log entry is committed once the leader that created the
-            # entry has replicated it on a majority of the servers
             self._commit_index = new_commit_index
 
     def _create_entries(self, commands: List[Command]) -> List[Entry]:
@@ -432,28 +443,25 @@ class RaftServer:
             List[Entry]: The Entry objects
         """
         entries = list()
-        next_index = len(self._log)
+        index = len(self._log)
         for command in commands:
             entries.append(
                 Entry(
                     command=command,
                     term=self.leader.current_term,
-                    index=next_index,
+                    index=index,
                 )
             )
-            next_index += 1
+            index += 1
 
         return entries
 
     def _apply_entries(self, index: int) -> None:
-        for i in range(self._last_applied, len(self._log)):
+        for i in range(self._last_applied, index + 1):
             entry = self._log[i]
-            if i <= index:
-                logging.info(f"Server {self.id} applying entry {entry}")
-                self._state_machine[entry.command.key] = entry.command.value
-                self._last_applied = i
-            else:
-                break
+            logging.info(f"Server {self.id} applying entry {entry}")
+            self._state_machine[entry.command.key] = entry.command.value
+            self._last_applied = i
 
         return self._state_machine[entry.command.key]
 
