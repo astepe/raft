@@ -115,7 +115,7 @@ class Vote:
     """
     Vote values can only move from None
     to a candidate id value. This prevents votes
-    from being changed after then are placed.
+    from being changed after they are placed.
     """
 
     def __init__(self):
