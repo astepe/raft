@@ -43,6 +43,15 @@ def network_delay(func):
     return wrapper
 
 
+class StateMachine:
+
+    def __init__(self):
+        self._state = dict()
+
+    def execute(self, command: Command):
+        self._state[command.key] = command.value
+
+
 class Entry:
     """
     Represents an entry in a server log
@@ -176,7 +185,7 @@ class RaftServer:
         self._cluster_events = cluster_events
         self._election_timeout = ElectionTimeout()
         self._request_thread_pool = ThreadPoolExecutor()
-        self._state_machine = dict()
+        self._state_machine = StateMachine()
         self._id = names.get_first_name()
         self._term_votes = defaultdict(Vote)
 
@@ -460,12 +469,12 @@ class RaftServer:
         for i in range(self._last_applied, index + 1):
             entry = self._log[i]
             logging.info(f"Server {self.id} applying entry {entry}")
-            self._state_machine[entry.command.key] = entry.command.value
+            self._state_machine.execute(entry.command)
             self._last_applied = i
 
-        return self._state_machine[entry.command.key]
+        return entry.command.value
 
-    # @network_delay
+    @network_delay
     def _append_entries(
         self,
         term: int,
@@ -535,7 +544,7 @@ class RaftServer:
 
         return self._current_term, True
 
-    # @network_delay
+    @network_delay
     def request_vote(
         self, term: int, candidate_id: int, last_log_index: int, last_log_term: int
     ) -> Tuple:
@@ -560,12 +569,13 @@ class RaftServer:
             self._current_term = term
             self._set_follower()
 
-        # If votedFor is null or candidateId, and candidate’s log is at
-        # least as up-to-date as receiver’s log, grant vote
+        if self._log and self._log[-1].term > last_log_term:
+            return self._current_term, False
+
         if (
             self._term_votes[term].value is None
             or self._term_votes[term].value == candidate_id
-        ) and len(self._log) <= last_log_index:
+        ) and len(self._log) - 1 <= last_log_index:
             self._term_votes[term].set(candidate_id, term, self.id)
             logging.info(f"Server: {self.id} in term {term} voting for {candidate_id}")
             return self._current_term, True
@@ -632,5 +642,5 @@ if __name__ == "__main__":
     raft_cluster.start()
     raft_cluster.set(x=3, y=5)
     logging.info("Response returned")
+    raft_cluster.stop()
     raft_cluster._events["stopped"].wait()
-    # raft_cluster.stop()

@@ -1,4 +1,4 @@
-from main.raft import RaftCluster
+from raft import RaftCluster
 
 
 class TestElectionSafety:
