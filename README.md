@@ -23,3 +23,7 @@ According to the Raft specification, the following 5 properties must always be t
 After the in-memory implementation is complete and validated, in-memory server-like objects will be 
 converted into individual Docker containers within a Kubernetes cluster. This will 
 more closely simulate a real-world distributed system of shared-nothing servers for which Raft was designed.
+
+
+### Running Locally
+Start a local server by executing `python run.py`. Send entries to the Raft cluster by opening a new terminal in the same directory and executing `python send.py '{"y": 7}'`. Send simple key/value pairs in json format.

@@ -1,6 +1,8 @@
 import concurrent.futures as cf
+import json
 import logging
 import random
+import socket
 import threading
 import time
 from collections import defaultdict, namedtuple
@@ -635,12 +637,3 @@ class RaftCluster:
     def set(self, **kwargs):
         commands = [Command(key=k, value=v) for k, v in kwargs.items()]
         self._servers[0].set_entries(commands)
-
-
-if __name__ == "__main__":
-    raft_cluster = RaftCluster()
-    raft_cluster.start()
-    raft_cluster.set(x=3, y=5)
-    logging.info("Response returned")
-    raft_cluster.stop()
-    raft_cluster._events["stopped"].wait()
